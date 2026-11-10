@@ -1,0 +1,122 @@
+name: APKTool Decompile-Recompile + Telegram
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: "Direct URL to the APK to decompile (or place apk in repo and set apk_path instead)"
+        required: false
+        default: ""
+      apk_path:
+        description: "Path to APK already in the repo (used if apk_url is empty)"
+        required: false
+        default: "input.apk"
+
+jobs:
+  apktool:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install apktool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget
+          wget -q https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool -O /usr/local/bin/apktool
+          wget -q https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.9.3.jar -O /usr/local/bin/apktool.jar
+          chmod +x /usr/local/bin/apktool /usr/local/bin/apktool.jar
+          apktool --version
+
+      - name: Get APK
+        run: |
+          mkdir -p work
+          if [ -n "${{ github.event.inputs.apk_url }}" ]; then
+            wget -q "${{ github.event.inputs.apk_url }}" -O work/input.apk
+          else
+            cp "${{ github.event.inputs.apk_path }}" work/input.apk
+          fi
+
+      - name: Decompile APK
+        run: |
+          cd work
+          apktool d input.apk -o decoded -f
+
+      - name: Recompile APK
+        run: |
+          cd work
+          apktool b decoded -o recompiled.apk
+
+      - name: Install build-tools (zipalign + apksigner)
+        run: |
+          sudo apt-get install -y unzip
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O cmdline-tools.zip
+          mkdir -p $HOME/android-sdk/cmdline-tools
+          unzip -q cmdline-tools.zip -d $HOME/android-sdk/cmdline-tools
+          mv $HOME/android-sdk/cmdline-tools/cmdline-tools $HOME/android-sdk/cmdline-tools/latest
+          yes | $HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager --sdk_root=$HOME/android-sdk "build-tools;34.0.0" > /dev/null
+          echo "$HOME/android-sdk/build-tools/34.0.0" >> "$GITHUB_PATH"
+
+      - name: Auto-generate keystore
+        env:
+          KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          cd work
+          keytool -genkeypair -v \
+            -keystore release.keystore \
+            -alias autokey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass "$KEYSTORE_PASS" -keypass "$KEYSTORE_PASS" \
+            -dname "CN=APKTool CI, OU=Dev, O=Linuxndroid, L=Jaipur, S=Rajasthan, C=IN"
+
+      - name: Zipalign + sign APK
+        env:
+          KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          cd work
+          zipalign -p 4 recompiled.apk recompiled-aligned.apk
+          apksigner sign --ks release.keystore \
+            --ks-pass pass:"$KEYSTORE_PASS" \
+            --ks-key-alias autokey \
+            --out recompiled-signed.apk \
+            recompiled-aligned.apk
+          apksigner verify recompiled-signed.apk
+
+      - name: Upload keystore as artifact (keep it safe!)
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-keystore
+          path: work/release.keystore
+          retention-days: 7
+
+      - name: Zip decompiled sources
+        run: |
+          cd work
+          zip -r decoded_sources.zip decoded
+
+      - name: Send files to Telegram
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          cd work
+          curl -s -F chat_id="$CHAT_ID" -F document=@recompiled-signed.apk \
+            -F caption="Recompiled + signed APK" \
+            "https://api.telegram.org/bot$BOT_TOKEN/sendDocument"
+          curl -s -F chat_id="$CHAT_ID" -F document=@decoded_sources.zip \
+            -F caption="Decompiled sources" \
+            "https://api.telegram.org/bot$BOT_TOKEN/sendDocument"
+
+      - name: Upload as workflow artifacts too
+        uses: actions/upload-artifact@v4
+        with:
+          name: apktool-output
+          path: |
+            work/recompiled-signed.apk
+            work/decoded_sources.zip
